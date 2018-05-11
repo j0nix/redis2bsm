@@ -3,8 +3,11 @@ Fetches data from a redis queue, preferably with data pushed from logstash, and 
 
 ## INSTALL
 yum install python-simplejson
+
 yum install python-redis
-mkdir /opt/redis2bsm
+
+mkdir -p /opt/redis2bsm
+
 mv redis2bsm classes /opt/redis2bsm
 
 ### CONF
