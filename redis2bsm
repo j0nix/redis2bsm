@@ -1,0 +1,403 @@
+#!/usr/bin/env python
+
+# Desc: 	READS from a redis queue and send part of message to BSM
+# Author:	j0nix 2015
+# Licence:	Free as in beer
+
+# Prereq:
+# 1. python 2.6.6 (or i guess within minor)
+#    python-simplejson
+#    python-redis 
+#
+# 2. Redis server where you push event that will be sent to bsm-connector.
+# 	If using Logstash, add following fields before push to redis:
+# 
+# 	add_field => {
+#		"[@alarm][title]" => "HEAP USAGE"
+#		"[@alarm][description]" => "Heap usage on %{host}"
+#		"[@alarm][severity]" => "Warning"
+#		"[@alarm][subcategory]" => " "
+#		"[@alarm][node]" => "%{host}"
+#		"[@alarm][ci_hint]" => " "
+#		"[@alarm][application]" => "gw-server"
+#		"[@alarm][object]" => " "
+# 	}
+#
+# 	Other applocation must push json as follows
+#
+#	"@alarm": {
+#   		"title": "HEAP USAGE",
+#   		"description": "Heap usage on tsrv-fms-omi-gw-1.int.comhem.com",
+#   		"severity": "Warning",
+#   		"subcategory": " ",
+#   		"node": "tsrv-fms-omi-gw-1.int.comhem.com",
+#   		"ci_hint": " ",
+#   		"application": "gw-server",
+#   		"object": " "
+# 	}
+#
+# 3. ...and obviously an endpoint for a bsm-connector. 
+
+import sys
+sys.path.append("/opt/redis2bsm/classes")
+from Daemon import Daemon
+import simplejson as json
+import time
+import os
+import ConfigParser
+import logging
+import httplib
+import redis
+
+class redis2bsm(Daemon):
+
+    # Set default config
+    CONFIG = {
+		'redis2bsm.debug':'off',
+		'redis2bsm.pollfrequency':30,
+		'redis2bsm.logfile':'/var/log/redis2bsm.log',
+		'redis.queue':'ALARM',
+		'redis.server':'127.0.0.1',
+		'bsm-connector.server':'127.0.0.1',
+		'bsm-connector.soap-url':'/SiteScope/services/reportMonitorData'
+    }
+
+    def __init__(self, pidfile='/var/run/redis2bsm.pid' ,configfile='/etc/redis2bsm.conf'):
+
+    	CONF = ConfigParser.ConfigParser()
+
+	try:
+		cfgfile = open(configfile, 'rb')
+
+	except IOError:
+
+		print "Could not read file {0}, try create file with defaults ".format(configfile)
+
+		try:
+			cfgfile = open(configfile,'w')
+		except IOError:
+			print "Could not create file {0} ... ".format(configfile)
+			sys.exit(1)
+
+		for key in self.CONFIG:
+        		(tmp1,tmp2) = key.split(".")
+			if CONF.has_section(tmp1):
+				CONF.set(tmp1,tmp2,self.CONFIG[key])
+			else:
+				CONF.add_section(tmp1)
+				CONF.set(tmp1,tmp2,self.CONFIG[key])
+
+		CONF.write(cfgfile)
+		cfgfile.close()
+
+	else:
+		cfgfile.close()
+    	
+	# Read config file
+    	try:
+    		CONF.read(configfile)
+    	except:
+		# We could catch specific error and create that file and/or notify pernissions error
+		print >> sys.stderr, "Can't read configfile, please verify /etc/redis2bsm.conf exists and read permissions are set"
+		sys.exit(1)
+		
+    	# Set variables if defined in configfile, else use defaults 
+	try: 
+    		#debug level on/off
+    		self.CONFIG['redis2bsm.debug'] = self.parse_config(CONF,"redis2bsm", "debug", self.CONFIG['redis2bsm.debug'])
+		#logfile 
+    		self.CONFIG['redis2bsm.logfile'] = self.parse_config(CONF,"redis2bsm", "logfile", self.CONFIG['redis2bsm.logfile'])
+    		#Time in seconds pause between redis pop actions. 
+    		self.CONFIG['redis2bsm.pollfrequency'] = self.parse_config(CONF,"redis2bsm", "pollfrequency", self.CONFIG['redis2bsm.pollfrequency'])
+    		#Name of redis list
+    		self.CONFIG['redis.queue'] = self.parse_config(CONF,"redis", "queue", self.CONFIG['redis.queue'])
+    		#redis server
+    		self.CONFIG['redis.server'] = self.parse_config(CONF,"redis", "server",  self.CONFIG['redis.server'])
+    		#bsm-connector host
+    		self.CONFIG['bsm-connector.server'] = self.parse_config(CONF,"bsm-connector", "server", self.CONFIG['bsm-connector.server'])
+    		#bsm-connector soap-api endpoint
+    		self.CONFIG['bsm-connector.soap-url'] = self.parse_config(CONF,"bsm-connector", "soap-url", self.CONFIG['bsm-connector.soap-url'])
+		
+
+	except:
+		print >> sys.stderr, "Can't set config variables? TypeO in configfile?"
+                sys.exit(1)
+
+	#init parent class, Daemonize....
+	# def __init__(self, pidfile, stdin, stdout, stderr):
+    	Daemon.__init__(self,pidfile,'/dev/null',self.CONFIG['redis2bsm.logfile'],self.CONFIG['redis2bsm.logfile'])
+
+
+    def parse_config(self,config,section,name,default):	
+	return config.get(section,name) if config.has_section(section) and config.has_option(section, name) else default
+
+
+    # func for reading pid of script see function run and class Daemon.py for more info of usage
+    def checkpid(self):
+	
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+	except IOError as (errno, strerror):
+		logging.debug("I/O error({0}): {1}" + format(str(errno)), str(strerror))
+	except ValueError:
+		logging.debug("Could not convert data to an integer.")
+	except:
+		pid=0
+
+       	return pid
+    
+    # func pop redis list, if any in queue send data to bsm-connector
+    def popRedis(self):
+
+	logging.info('Poping redis queue ' + self.CONFIG['redis.queue'])
+
+	# open connection to redis-server
+	try:
+		r = redis.Redis(self.CONFIG['redis.server'])
+	except:
+		e = sys.exc_info()
+		logging.error("Failed to connect redis server @ " + self.CONFIG['redis.server'] + ", errmsg: " + str(e))
+		return True
+
+	# get nr of rows in list
+	try:
+		queuelen = r.llen(self.CONFIG['redis.queue'])
+	except:
+		e = sys.exc_info()
+		logging.error( 'Failed to get list length (llen) from queue ' + self.CONFIG['redis.queue'] + ", errmsg: " + str(e))
+		return True
+
+	# Only run if any entrys in redis list
+	if queuelen > 0:
+				
+		logging.info( str(queuelen) + ' events in queue')
+
+		# if we have more than 1 entry in redis we collect entrys every 5 sec, this to 
+		# in a reasonable controlled way (and timeframe) process queues.
+		if queuelen > 1:
+
+			while queuelen > 1:
+			
+				# Get the event
+				try:	
+					getlarm = r.rpop(self.CONFIG['redis.queue'])
+				except:
+					e = sys.exc_info()
+					logging.error("Failed pop redis server " + str(e) )
+				# Notify event
+				try:
+					self.notifyEvent(getlarm)
+				except:
+					e = sys.exc_info()
+					logging.error( str(e) )
+				else: 
+					# Get new quelength
+					queuelen = r.llen(self.CONFIG['redis.queue'])
+					if (queuelen % 2 == 0 ):
+						logging.info( str(queuelen) + ' events in queue')
+					#wait 5 sec before processing again
+					#time.sleep(5)
+					self.goToSleep(5)
+
+		#If we got out of loop we should have atleast one event left, get that				
+		try:	
+			getlarm = r.rpop(self.CONFIG['redis.queue'])
+		except:
+			e = sys.exc_info()[1]
+			logging.info("Failed pop redis server " + str(e) )
+
+		else:
+			# Notify event
+			self.notifyEvent(getlarm)
+
+	else:
+		logging.info(self.CONFIG['redis.queue'] + ' Queue is empty...')
+
+    def goToSleep(self,t):
+	logging.info('Pause ' + str(t) + ' seconds')
+	try:
+		time.sleep(int(t))
+	except:
+		logging.error("Ehhh.. failed to chill!?")
+
+    # put back message in redis, this is done when we get a nofifyEvent exeption after we poped redis queue
+    def pushRedis (self,message):
+
+	logging.info('Push back message in redis queue ' + self.CONFIG['redis.queue'])
+
+        # open connection to redis-server
+        try:
+                r = redis.Redis(self.CONFIG['redis.server'])
+        except:
+                e = sys.exc_info()
+                logging.error("Failed to connect redis server @ " + self.CONFIG['redis.server'] + ", errmsg: " + str(e))
+                return True
+
+	else:
+		try:
+			r.lpush(self.CONFIG['redis.queue'],message)
+		except:
+			logging.error("Failed push message: " + message )
+
+
+    # Send event to bsm-connector
+    def notifyEvent(self,message):
+
+	logging.debug("Incoming message: " + message)
+	logging.debug("Prepare to send event to " + self.CONFIG['bsm-connector.server'] + self.CONFIG['bsm-connector.soap-url'])
+
+	# Parse that json data
+	parsed_json = json.loads(message)
+
+	logging.debug("Data in @alarm that will enrich soap message:\n" + json.dumps(parsed_json['@alarm'], sort_keys=True,indent=4, separators=(',', ': ')))
+
+	# put json data in soap message 
+	try: 
+		body = """
+                <soapenv:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:web="http://webservice.soa.monitors.sitescope.mercury.com" xmlns:soapenc="http://schemas.xmlsoap.org/soap/encoding/">
+                <soapenv:Body>
+                        <web:reportData soapenv:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+                        <systemId xsi:type="xsd:string">fms-event-ws-listener</systemId>
+                        <data xsi:type="rep:ArrayOf_tns1_DataMessage" soapenc:arrayType="mes:DataMessage[]" xmlns:rep="http://localhost:8080/SiteScope/services/reportMonitorData" xmlns:mes="messages.client.webservice.soa.monitors.sitescope.mercury.com">
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Title</key>
+                                        <value xsi:type="soapenc:string">{0}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Description</key>
+                                        <value xsi:type="soapenc:string">{1}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Severity</key>
+                                        <value xsi:type="soapenc:string">{2}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">SubCategory</key>
+                                        <value xsi:type="soapenc:string">{3}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Node</key>
+                                        <value xsi:type="soapenc:string">{4}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Ci_Hint</key>
+                                        <value xsi:type="soapenc:string">{5}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Application</key>
+                                        <value xsi:type="soapenc:string">{6}</value>
+                                </data>
+                                <data xsi:type="mes:DataMessage"><key xsi:type="soapenc:string">Object</key>
+                                        <value xsi:type="soapenc:string">{7}</value>
+                                </data>
+                        </data>
+                        </web:reportData>
+                </soapenv:Body>
+                </soapenv:Envelope>""".format(parsed_json['@alarm']['title'], parsed_json['@alarm']['description'], parsed_json['@alarm']['severity'], parsed_json['@alarm']['subcategory'],parsed_json['@alarm']['node'], parsed_json['@alarm']['ci_hint'], parsed_json['@alarm']['application'], parsed_json['@alarm']['object'])
+
+	except:
+                e = sys.exc_info()
+                logging.error(str(e))
+		body = "ERROR ADDING DATA FROM SYSLOG EVENT"
+
+	logging.debug("SOAP XML:\n" + body)
+
+	# http headers
+	headers = {
+    		'User-Agent': 'python',
+		'Content-Type': 'text/xml',
+		'SOAPAction': 'no-cache',
+	}
+
+	# Preparing POST request
+	conn = httplib.HTTPSConnection(self.CONFIG['bsm-connector.server'], timeout=10)
+	# POST data to bsm-connector
+	try:	
+		conn.request("POST",self.CONFIG['bsm-connector.soap-url'] , body, headers)
+	except:
+		logging.error("Cannot connect to " + str(self.CONFIG['bsm-connector.server']))
+		self.pushRedis(message)
+
+	# Get response data
+	else:
+		response = conn.getresponse()
+		logging.debug("Response status: " + str(response.status) + " " + str(response.reason) + ", response message:\n" + str(response.read()))
+
+		# Check if we got 200 OK	
+		if response.status == 200:
+			logging.info("Event sent to BSM")
+		else:
+			logging.error("RESPONSE : " + str(response.status) + " - " + str(response.reason))
+			logging.error(response.read())
+			logging.error("Oooops! Bad response status from " + str(self.CONFIG['bsm-connector.server']))
+			self.pushRedis(message)
+
+    def daemon(self):
+
+	#Set logging data
+    	if self.CONFIG['redis2bsm.debug'] == "on":
+		logging.basicConfig(filename='/var/log/redis2bsm.log',level=logging.DEBUG,format='%(asctime)s\t[%(levelname)s]\t[%(funcName)s]\t%(message)s')
+    		logging.info("DEBUG mode, extended logging")
+	else:
+		logging.basicConfig(filename='/var/log/redis2bsm.log',level=logging.INFO,format='%(asctime)s\t[%(levelname)s]\t[%(funcName)s]\t%(message)s')
+    	
+        logging.info('Daemon START')
+	logging.info('Config => ' + str(self.CONFIG) )
+
+	# Get process id
+        pid = self.checkpid()
+
+	# loop until pid data is removed
+        while (pid > 0):
+
+            logging.info('Checking for new messages in redis')
+
+	    # Start the magic
+	    try:
+	    	self.popRedis()
+	    except:
+		e = sys.exc_info()
+		logging.error(str(e))
+		sys.exit(1)
+
+            #logging.info('Daemon now go to sleep for ' + str(self.CONFIG['redis2bsm.pollfrequency']) + ' seconds...')
+	    
+	    # Pause...
+	    try:
+            	#time.sleep(int(self.CONFIG['redis2bsm.pollfrequency']))
+		self.goToSleep(self.CONFIG['redis2bsm.pollfrequency'])
+	    except:
+		e = sys.exc_info()
+		logging.error(str(e))
+		sys.exit(1)
+
+	    # check if we still are going wild and crazy...
+            pid = self.checkpid()
+
+        # out of the loop
+        logging.info('Shutting down %i' % (pid))
+
+        # Logging
+        logging.shutdown()
+
+        # System
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+
+	# create object redis2bsm
+	daemon = redis2bsm()
+
+	# Validate what Daemon function to call
+	if len(sys.argv) == 2:
+
+		if 'start' == sys.argv[1]:
+			daemon.start()
+		elif 'stop' == sys.argv[1]:
+			daemon.stop()
+		elif 'restart' == sys.argv[1]:
+			daemon.restart()
+		else:
+			print "Unknown command"
+			sys.exit(2)
+			sys.exit(0)
+	else:
+		print "usage: %s start|stop|restart" % sys.argv[0]
+		sys.exit(2)
+

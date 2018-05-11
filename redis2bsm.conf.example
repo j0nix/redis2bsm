@@ -1,0 +1,12 @@
+[redis2bsm]
+debug = on
+pollfrequency = 20
+logfile = /var/log/redis2bsm.log
+
+[redis]
+redis_server = 127.0.0.1
+redis_queue = ALARM
+
+[bsm-connector]
+server = bsmconnector.example.com:30000
+soap-url = /SiteScope/services/reportMonitorData
