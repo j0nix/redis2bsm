@@ -19,7 +19,7 @@
 #		"[@alarm][subcategory]" => " "
 #		"[@alarm][node]" => "%{host}"
 #		"[@alarm][ci_hint]" => " "
-#		"[@alarm][application]" => "gw-server"
+#		"[@alarm][application]" => "java-crap-server"
 #		"[@alarm][object]" => " "
 # 	}
 #
@@ -27,12 +27,12 @@
 #
 #	"@alarm": {
 #   		"title": "HEAP USAGE",
-#   		"description": "Heap usage on tsrv-fms-omi-gw-1.int.comhem.com",
+#   		"description": "Heap usage on server",
 #   		"severity": "Warning",
 #   		"subcategory": " ",
-#   		"node": "tsrv-fms-omi-gw-1.int.comhem.com",
+#   		"node": "server-1.example.com",
 #   		"ci_hint": " ",
-#   		"application": "gw-server",
+#   		"application": "java-crap-server",
 #   		"object": " "
 # 	}
 #
