@@ -1,6 +1,8 @@
 ## About redis2bsm
 **OS**: CentOS 6.6 +
-**Usecase**: redis2bsm was developed for the usecase to catch events in a Logstash that forwards them to a redis queue. Then this redis2bsm daemon pops that redis queue and forwards events to a soap api on a HP BSM Connector instance.
+
+**Usecase**: 
+redis2bsm was developed for the usecase to catch specific syslog events sent to a ELK installation. The only way to get notified by a specific error from some crappy network equipment was with syslog messages. To automagicly get notified about these events a logstash instance identifies and forward these to a redis queue. Then this redis2bsm daemon pops that redis queue and forwards events to a soap api on a HP BSM Connector instance. 
 
 ### INSTALL
 #### prerequisite 
