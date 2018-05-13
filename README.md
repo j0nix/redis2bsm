@@ -62,7 +62,9 @@ hz 10
 aof-rewrite-incremental-fsync yes
 EOF
 ```
-####redis2bsm
+
+#### redis2bsm
+
 ```
 mkdir -p /opt/redis2bsm && cd /opt/redis2bsm
 git clone https://github.com/j0nix/redis2bsm.git
